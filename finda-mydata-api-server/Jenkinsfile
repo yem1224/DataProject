@@ -1,0 +1,81 @@
+pipeline {
+    agent any
+    environment {
+        // Environmental Variables of Slack
+        SLACK_CHANNEL_NAME  = '#운영알람-jenkins'
+        SLACK_COLOR_DANGER  = '#E01563'
+        SLACK_COLOR_INFO    = '#6ECADC'
+        SLACK_COLOR_WARNING = '#FFC300'
+        SLACK_COLOR_GOOD    = '#3EB991'
+        SERVICE_NAME        = 'mydata'
+
+        // Environmental Variables of CI, CD and Docker
+        PCR_REPOSITORY_URI  = "${PCR_REPO_URI}/${JOB_NAME}"
+        GIT_URL             = "${GITLAB_URL}/finda-datalake/finda-mydata-api-server.git"
+        TAG                 = sh(returnStdout: true, script: "date +%Y%m%d%H%M%S-develop-${GIT_COMMIT} | cut -c1-30")
+        COMMIT_AUTHOR       = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' ${GIT_COMMIT}").trim()
+        COMMIT_MESSAGE      = sh(returnStdout: true, script: 'git log -1 --pretty=%B').trim()
+    } 
+    stages {
+        stage('Compile') {
+          steps {
+            echo '>> Build mvn to jar'
+            sh 'mvn clean package -Dmaven.test.skip=true'
+          }
+        }
+        stage('Continuous Integration') {
+            steps {
+                sh 'docker login --username AWS -p $(aws ecr get-login-password --region ap-northeast-2) 579321569587.dkr.ecr.ap-northeast-2.amazonaws.com'
+                
+                echo '>> [Continuous Integration] Build New Docker image'
+                sh 'docker build -t $JOB_NAME:$TAG .'
+                
+                echo '>> [Continuous Integration] Push New Docker image to Private Container Registry'
+                sh 'docker tag $JOB_NAME:$TAG $PCR_REPOSITORY_URI:$TAG'
+                sh 'docker push $PCR_REPOSITORY_URI:$TAG'
+            }
+        }
+        stage('Continuous Deploy') {
+            steps {
+                echo '>> [Continuous Deploy] Container Tag Update in Helm Chart'
+                script {
+                    RESOURCES_PATH = "/var/lib/jenkins/workspace/${JOB_NAME}/mydata-gitops/applications/backend/${SERVICE_NAME}"
+                }
+                sh "git clone ${GITOPS_REPO_URI} && yq w -i ${RESOURCES_PATH}/values.yaml tag ${TAG}"
+                sh "cd ${RESOURCES_PATH} && git status && git add * && git status && git commit -m 'Publish new version ${TAG} to java api ${SERVICE_NAME}' && git push origin master || echo 'no changes'"
+            }
+        }
+    }
+    post {
+        always {
+            echo ">> [Remove GitOps Directory] Remove Helm Chart in ${JOB_NAME} of Jenkins"
+            sh "rm -rf /var/lib/jenkins/workspace/${JOB_NAME}/mydata-gitops"
+        }
+        success {
+            wrap([$class: 'BuildUser']) {
+                echo 'Jenkins 동작이 성공적으로 완료되었습니다.'
+                slackSend (
+                    color: "${SLACK_COLOR_GOOD}",
+                    channel: "${SLACK_CHANNEL_NAME}",
+                    message: "*${JOB_NAME}, #${BUILD_NUMBER}*\n\n*Success*\n${COMMIT_AUTHOR}\n\n*Branch*\n${GIT_BRANCH}\n\n*Last Commit*\n${COMMIT_MESSAGE}\n\n\n*More info at*\n\n - jenkin link: ${BUILD_URL}\n - git url: ${GIT_URL}\n"
+                )
+            }
+        }
+        failure {
+            wrap([$class: 'BuildUser']) {
+                echo 'Jenkins 동작이 실패했습니다.'
+                slackSend (
+                    color: "${SLACK_COLOR_WARNING}",
+                    channel: "${SLACK_CHANNEL_NAME}",
+                    message: "*${JOB_NAME}, #${BUILD_NUMBER}*\n\n*Failure*\n${COMMIT_AUTHOR}\n\n*Branch*\n${GIT_BRANCH}\n\n*Last Commit*\n${COMMIT_MESSAGE}\n\n\n*More info at*\n\n - jenkin link: ${BUILD_URL}\n - git url: ${GIT_URL}\n"
+                )
+            }
+        }
+        unstable {
+            echo ">> [Unstable] Pipeline Run status is Unstable. Please check the status of Pipeline."
+        }
+        changed {
+            echo '>> [Changed] Pipeline status has changed.'
+        }
+    }
+}
